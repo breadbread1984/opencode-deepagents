@@ -32,6 +32,32 @@ from src.permission import (
 from src.snapshot import SnapshotStore
 
 
+def _run_async(coro):
+    """Run a coroutine safely in both sync and async (running event loop) contexts."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    # Already inside a running event loop — run in a fresh thread
+    result_holder = []
+    exc_holder = []
+
+    def _target():
+        try:
+            result_holder.append(asyncio.run(coro))
+        except Exception as e:
+            exc_holder.append(e)
+
+    t = threading.Thread(target=_target)
+    t.start()
+    t.join()
+
+    if exc_holder:
+        raise exc_holder[0]
+    return result_holder[0]
+
+
 class CodingAgent:
     """AI coding agent powered by deepagents with full opencode features.
 
@@ -92,7 +118,7 @@ class CodingAgent:
         if self._checkpointer is not None:
             if self._checkpointer_ctx is not None:
                 try:
-                    asyncio.run(self._checkpointer_ctx.__aexit__(None, None, None))
+                    _run_async(self._checkpointer_ctx.__aexit__(None, None, None))
                 except Exception:
                     pass
                 self._checkpointer_ctx = None
@@ -114,7 +140,7 @@ class CodingAgent:
                 saver = await ctx.__aenter__()
                 return ctx, saver
 
-            self._checkpointer_ctx, self._checkpointer = asyncio.run(_enter_ctx())
+            self._checkpointer_ctx, self._checkpointer = _run_async(_enter_ctx())
 
         return self._checkpointer
 
@@ -470,7 +496,7 @@ class CodingAgent:
         """Release resources (checkpointer connections)."""
         if self._checkpointer_ctx is not None:
             try:
-                asyncio.run(self._checkpointer_ctx.__aexit__(None, None, None))
+                _run_async(self._checkpointer_ctx.__aexit__(None, None, None))
             except Exception:
                 pass
             self._checkpointer_ctx = None
