@@ -15,7 +15,7 @@ from deepagents.backends import FilesystemBackend, LocalShellBackend
 from deepagents.middleware.subagents import SubAgent
 
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
 from src.config import (
@@ -92,7 +92,7 @@ class CodingAgent:
         if self._checkpointer is not None:
             if self._checkpointer_ctx is not None:
                 try:
-                    self._checkpointer_ctx.__exit__(None, None, None)
+                    asyncio.run(self._checkpointer_ctx.__aexit__(None, None, None))
                 except Exception:
                     pass
                 self._checkpointer_ctx = None
@@ -108,8 +108,13 @@ class CodingAgent:
         else:
             db_path = Path(self.checkpoint_db_path)
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._checkpointer_ctx = SqliteSaver.from_conn_string(str(db_path))
-            self._checkpointer = self._checkpointer_ctx.__enter__()
+
+            async def _enter_ctx():
+                ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
+                saver = await ctx.__aenter__()
+                return ctx, saver
+
+            self._checkpointer_ctx, self._checkpointer = asyncio.run(_enter_ctx())
 
         return self._checkpointer
 
@@ -465,7 +470,7 @@ class CodingAgent:
         """Release resources (checkpointer connections)."""
         if self._checkpointer_ctx is not None:
             try:
-                self._checkpointer_ctx.__exit__(None, None, None)
+                asyncio.run(self._checkpointer_ctx.__aexit__(None, None, None))
             except Exception:
                 pass
             self._checkpointer_ctx = None
