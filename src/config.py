@@ -238,7 +238,7 @@ def load_model_config() -> ModelConfig:
         model=os.getenv("LLM_MODEL", "gpt-4o"),
         temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
         api_key=os.getenv("OPENAI_API_KEY", os.getenv("ANTHROPIC_API_KEY", "")),
-        base_url=os.getenv("OPENAI_BASE_URL", ""),
+        base_url=os.getenv("OPENAI_BASE_URL", os.getenv("LLM_ENDPOINT", "")),
     )
 
 
