@@ -156,10 +156,10 @@ class CodingAgent:
             model=self.model_config.to_model_string(),
             tools=tools,
             system_prompt=system_prompt,
-            sub_agents=sub_agents,
+            subagents=sub_agents,
             backend=backend,
             checkpointer=checkpointer,
-            interrupt_before=["tools"],
+            interrupt_on={"tools": True},
         )
 
         return agent
@@ -236,7 +236,7 @@ class CodingAgent:
                 }
 
         # After the stream finishes (may be interrupted), check if the graph
-        # is paused at the tools node (interrupt_before=["tools"] triggered).
+        # is paused at the tools node (interrupt_on triggered).
         state = self.graph.get_state(config)
         is_interrupted = bool(state and state.next and "tools" in state.next)
 
