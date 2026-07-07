@@ -9,6 +9,8 @@ services:
     ports:
       - "${HOST_PORT:-7860}:7860"
     volumes:
+      # Mount host project code into container (restart container to pick up code changes)
+      - ..:/app
       - workspace_data:/workspace
       - checkpoint_data:/root/.opencode-deepagents
       # Mount a host directory as workspace (uncomment and adjust path):
