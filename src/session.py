@@ -1,7 +1,8 @@
 """Lightweight session metadata store (SQLite).
 
 deepagents handles conversation state via its LangGraph checkpointer.
-This module stores session metadata: name, workspace, model, mode, thread_id.
+This module stores session metadata: name, workspace, model, mode, thread_id,
+permission settings, and snapshot references.
 """
 
 import sqlite3
@@ -32,12 +33,46 @@ def _migrate(conn: sqlite3.Connection):
             workspace TEXT NOT NULL DEFAULT '.',
             model TEXT NOT NULL DEFAULT 'gpt-4o',
             agent_mode TEXT NOT NULL DEFAULT 'build',
+            hitl_enabled INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
     """)
+
+    # Add hitl_enabled column if missing (migration from old schema)
+    cols = [c[1] for c in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+    if "hitl_enabled" not in cols:
+        conn.execute("ALTER TABLE sessions ADD COLUMN hitl_enabled INTEGER NOT NULL DEFAULT 1")
+
+    # Permission cache table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS permission_cache (
+            session_id TEXT NOT NULL,
+            cache_key TEXT NOT NULL,
+            action TEXT NOT NULL,  -- 'approve' or 'deny'
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (session_id, cache_key),
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+    """)
+
+    # Snapshot log table
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL,
+            label TEXT NOT NULL,
+            message_index INTEGER,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        )
+    """)
+
     conn.commit()
 
+
+# ── Session CRUD ──
 
 def create_session(
     name: str = "Untitled",
@@ -53,8 +88,8 @@ def create_session(
     conn = _get_db()
     try:
         conn.execute(
-            """INSERT INTO sessions (id, thread_id, name, workspace, model, agent_mode, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO sessions (id, thread_id, name, workspace, model, agent_mode, hitl_enabled, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)""",
             (session_id, thread_id, name, workspace, model, agent_mode, now, now),
         )
         conn.commit()
@@ -95,7 +130,7 @@ def get_thread_id(session_id: str) -> Optional[str]:
 
 def update_session(session_id: str, **kwargs):
     """Update session metadata fields."""
-    allowed = {"name", "model", "agent_mode", "workspace"}
+    allowed = {"name", "model", "agent_mode", "workspace", "hitl_enabled"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return
@@ -113,10 +148,69 @@ def update_session(session_id: str, **kwargs):
 
 
 def delete_session(session_id: str):
-    """Delete a session."""
+    """Delete a session and its cached permissions/snapshots."""
     conn = _get_db()
     try:
+        conn.execute("DELETE FROM permission_cache WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM snapshots WHERE session_id = ?", (session_id,))
         conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Permission Cache ──
+
+def save_permission_cache(session_id: str, key: str, action: str):
+    """Save a permission decision (approve/deny) for a tool+pattern."""
+    conn = _get_db()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """INSERT OR REPLACE INTO permission_cache (session_id, cache_key, action, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, key, action, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def load_permission_cache(session_id: str) -> dict[str, str]:
+    """Load all cached permission decisions for a session."""
+    conn = _get_db()
+    try:
+        rows = conn.execute(
+            "SELECT cache_key, action FROM permission_cache WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+        return {r["cache_key"]: r["action"] for r in rows}
+    finally:
+        conn.close()
+
+
+def clear_permission_cache(session_id: str):
+    """Clear all cached permission decisions for a session."""
+    conn = _get_db()
+    try:
+        conn.execute("DELETE FROM permission_cache WHERE session_id = ?", (session_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Snapshot Log ──
+
+def log_snapshot(session_id: str, snapshot_hash: str, label: str, message_index: Optional[int] = None):
+    """Record a filesystem snapshot for tracking."""
+    conn = _get_db()
+    try:
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """INSERT INTO snapshots (session_id, snapshot_hash, label, message_index, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (session_id, snapshot_hash, label, message_index, now),
+        )
         conn.commit()
     finally:
         conn.close()
