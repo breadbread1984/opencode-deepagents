@@ -42,7 +42,7 @@ Examples:
     os.environ["DEFAULT_WORKSPACE"] = str(Path(args.workspace).resolve())
     os.environ["DEFAULT_AGENT_MODE"] = args.mode
 
-    from src.ui import create_app
+    from src.ui import create_app, THEME, CSS
 
     workspace = str(Path(args.workspace).resolve())
     print(f"""
@@ -58,7 +58,7 @@ Examples:
 """)
 
     app = create_app()
-    app.launch(server_name=args.host, server_port=args.port, share=args.share)
+    app.launch(server_name=args.host, server_port=args.port, share=args.share, theme=THEME, css=CSS)
 
 
 if __name__ == "__main__":

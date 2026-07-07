@@ -113,7 +113,7 @@ class GradioApp:
         self._submit_lock = False
 
     def build(self) -> gr.Blocks:
-        with gr.Blocks(theme=THEME, css=CSS, title="OpenCode DeepAgents", fill_height=True) as app:
+        with gr.Blocks(title="OpenCode DeepAgents", fill_height=True) as app:
             # Hidden state for HITL approval tracking
             self._hitl_state = gr.State({
                 "pending": False, "tool": "", "input": "",
@@ -187,8 +187,7 @@ class GradioApp:
 
     def _build_chat(self):
         self.chatbot = gr.Chatbot(
-            label="", height=600, type="messages",
-            bubble_full_width=False, render_markdown=True,
+            label="", height=600,
         )
         with gr.Row():
             self.msg_input = gr.Textbox(
