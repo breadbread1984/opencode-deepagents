@@ -32,32 +32,6 @@ from src.permission import (
 from src.snapshot import SnapshotStore
 
 
-def _run_async(coro):
-    """Run a coroutine safely in both sync and async (running event loop) contexts."""
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        return asyncio.run(coro)
-
-    # Already inside a running event loop — run in a fresh thread
-    result_holder = []
-    exc_holder = []
-
-    def _target():
-        try:
-            result_holder.append(asyncio.run(coro))
-        except Exception as e:
-            exc_holder.append(e)
-
-    t = threading.Thread(target=_target)
-    t.start()
-    t.join()
-
-    if exc_holder:
-        raise exc_holder[0]
-    return result_holder[0]
-
-
 class CodingAgent:
     """AI coding agent powered by deepagents with full opencode features.
 
@@ -110,15 +84,21 @@ class CodingAgent:
         # Background sub-agent tracking
         self._bg_tasks: dict[str, "BackgroundTask"] = {}
 
-        # Build the graph
-        self.graph = self._build_graph()
+        # Graph is lazily initialized on first astream() call
+        self.graph = None
 
-    def _create_checkpointer(self):
-        """Create or reuse a checkpointer. Closes old SQLite connections on rebuild."""
+    async def _ensure_graph(self):
+        """Lazily build the agent graph with async checkpointer setup.
+        Called from astream() / resume() to handle the running event loop properly.
+        """
+        if self.graph is not None:
+            return
+
+        # Close old checkpointer if re-building
         if self._checkpointer is not None:
             if self._checkpointer_ctx is not None:
                 try:
-                    _run_async(self._checkpointer_ctx.__aexit__(None, None, None))
+                    await self._checkpointer_ctx.__aexit__(None, None, None)
                 except Exception:
                     pass
                 self._checkpointer_ctx = None
@@ -129,20 +109,16 @@ class CodingAgent:
                     pass
             self._checkpointer = None
 
+        # Create checkpointer with proper async handling
         if self.checkpoint_db_path == ":memory:":
             self._checkpointer = MemorySaver()
         else:
             db_path = Path(self.checkpoint_db_path)
             db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._checkpointer_ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
+            self._checkpointer = await self._checkpointer_ctx.__aenter__()
 
-            async def _enter_ctx():
-                ctx = AsyncSqliteSaver.from_conn_string(str(db_path))
-                saver = await ctx.__aenter__()
-                return ctx, saver
-
-            self._checkpointer_ctx, self._checkpointer = _run_async(_enter_ctx())
-
-        return self._checkpointer
+        self.graph = self._build_graph()
 
     def _build_graph(self):
         """Build the deep agent with mode-appropriate configuration and HITL."""
@@ -181,8 +157,6 @@ class CodingAgent:
             ),
         ]
 
-        checkpointer = self._create_checkpointer()
-
         # System prompt with model-specific overrides
         provider = getattr(self.model_config, "provider", "openai")
         system_prompt = mode.format_prompt(self.workspace, provider)
@@ -197,7 +171,7 @@ class CodingAgent:
             system_prompt=system_prompt,
             subagents=sub_agents,
             backend=backend,
-            checkpointer=checkpointer,
+            checkpointer=self._checkpointer,
             interrupt_on={"tools": True},
         )
 
@@ -227,6 +201,8 @@ class CodingAgent:
             {"type": "tool_end", "name": "...", "output": "..."}
             {"type": "done"}
         """
+        await self._ensure_graph()
+
         config = {"configurable": {"thread_id": thread_id}}
 
         last_tool_name = None
@@ -347,6 +323,8 @@ class CodingAgent:
             tool_call_id: The tool call ID to approve/reject
             remember: Whether to save this decision permanently
         """
+        await self._ensure_graph()
+
         config = {"configurable": {"thread_id": thread_id}}
         decision = "approved" if approved else "rejected"
 
@@ -440,25 +418,25 @@ class CodingAgent:
         return "No previous snapshot available for undo"
 
     def set_mode(self, mode: str):
-        """Switch agent mode and rebuild."""
+        """Switch agent mode. Graph rebuilds lazily on next astream()."""
         if mode not in AGENT_MODES:
             raise ValueError(f"Unknown agent mode: {mode}. Use {list(AGENT_MODES.keys())}")
         self.agent_mode = mode
         self.mode_config = AGENT_MODES[mode]
         self.permission = build_default_permissions(mode, self.workspace)
-        self.graph = self._build_graph()
+        self.graph = None  # invalidate — rebuilds lazily
 
     def set_workspace(self, workspace: str):
-        """Change workspace and rebuild."""
+        """Change workspace. Graph rebuilds lazily on next astream()."""
         self.workspace = str(Path(workspace).resolve())
         self.snapshot = SnapshotStore(self.workspace)
         self.permission = build_default_permissions(self.agent_mode, self.workspace)
-        self.graph = self._build_graph()
+        self.graph = None  # invalidate — rebuilds lazily
 
     def set_model(self, model_config: ModelConfig):
-        """Change model and rebuild."""
+        """Change model. Graph rebuilds lazily on next astream()."""
         self.model_config = model_config
-        self.graph = self._build_graph()
+        self.graph = None  # invalidate — rebuilds lazily
 
     def list_snapshots(self, limit: int = 10) -> list[dict]:
         """List recent filesystem snapshots."""
@@ -492,11 +470,11 @@ class CodingAgent:
     def list_background_tasks(self) -> list[dict]:
         return [t.status() for t in self._bg_tasks.values()]
 
-    def close(self):
+    async def close(self):
         """Release resources (checkpointer connections)."""
         if self._checkpointer_ctx is not None:
             try:
-                _run_async(self._checkpointer_ctx.__aexit__(None, None, None))
+                await self._checkpointer_ctx.__aexit__(None, None, None)
             except Exception:
                 pass
             self._checkpointer_ctx = None

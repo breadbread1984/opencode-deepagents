@@ -310,7 +310,7 @@ class GradioApp:
 
         session_id = self._ensure_session(session_id, message)
         model_config = self._build_model_config(model_provider, model_name, api_key, api_base)
-        self._ensure_agent(model_config, workspace, agent_mode)
+        await self._ensure_agent(model_config, workspace, agent_mode)
 
         history.append({"role": "user", "content": message})
         yield "", history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
@@ -619,13 +619,13 @@ class GradioApp:
             self.current_session_id = session_id
         return session_id
 
-    def _ensure_agent(self, model_config, workspace, agent_mode):
+    async def _ensure_agent(self, model_config, workspace, agent_mode):
         ws_resolved = str(Path(workspace).resolve())
         if self.agent is None:
             self.agent = CodingAgent(model_config=model_config, workspace=workspace, agent_mode=agent_mode)
         elif self.agent.agent_mode != agent_mode or self.agent.workspace != ws_resolved:
             # Close old agent to free DB connections
-            self.agent.close()
+            await self.agent.close()
             self.agent = CodingAgent(model_config=model_config, workspace=workspace, agent_mode=agent_mode)
 
     def _tool_class(self, name: str) -> str:
