@@ -165,10 +165,9 @@ Type these in the chat:
 |---|---|---|
 | `LLM_PROVIDER` | `openai` | Model provider |
 | `LLM_MODEL` | `gpt-4o` | Model name |
-| `LLM_ENDPOINT` | — | Generic LLM API endpoint (fallback for provider-specific URLs) |
 | `OPENAI_API_KEY` | — | API key |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key |
-| `OPENAI_BASE_URL` | — | OpenAI-compatible API endpoint |
+| `OPENAI_BASE_URL` | — | OpenAI-compatible API endpoint (supports DashScope, Ollama, etc.) |
 | `MAX_TOOL_ITERATIONS` | `50` | Max tool calls per turn |
 | `TOOL_TIMEOUT_SECONDS` | `120` | Tool timeout |
 | `DEFAULT_AGENT_MODE` | `build` | Default agent mode |
