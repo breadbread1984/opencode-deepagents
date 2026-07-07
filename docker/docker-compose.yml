@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  opencode-deepagents:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: opencode-deepagents
+    ports:
+      - "${HOST_PORT:-7860}:7860"
+    volumes:
+      - workspace_data:/workspace
+      - checkpoint_data:/root/.opencode-deepagents
+      # Mount a host directory as workspace (uncomment and adjust path):
+      # - ~/my-project:/workspace
+    env_file:
+      - ../.env
+    environment:
+      - DEFAULT_AGENT_MODE=${DEFAULT_AGENT_MODE:-build}
+      - DEFAULT_WORKSPACE=/workspace
+    restart: unless-stopped
+
+volumes:
+  workspace_data:
+  checkpoint_data:
