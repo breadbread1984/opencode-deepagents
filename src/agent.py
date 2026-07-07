@@ -19,6 +19,8 @@ from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend, LocalShellBackend
 from deepagents.middleware.subagents import SubAgent
 
+from langchain_openai import ChatOpenAI
+
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
@@ -125,6 +127,24 @@ class CodingAgent:
 
         self.graph = self._build_graph()
 
+    def _build_chat_model(self):
+        """Create a ChatOpenAI instance for OpenAI-compatible endpoints.
+
+        stream_usage=False prevents the OpenAI SDK from adding
+        ``stream_options={"include_usage": true}`` to streaming requests,
+        which DashScope and other compatible APIs do not support.
+        """
+        kwargs: dict = {
+            "model": self.model_config.model,
+            "temperature": self.model_config.temperature,
+            "stream_usage": False,
+        }
+        if self.model_config.api_key:
+            kwargs["openai_api_key"] = self.model_config.api_key
+        if self.model_config.base_url:
+            kwargs["openai_api_base"] = self.model_config.base_url
+        return ChatOpenAI(**kwargs)
+
     def _build_graph(self):
         """Build the deep agent with mode-appropriate configuration and HITL."""
         mode = self.mode_config
@@ -136,7 +156,10 @@ class CodingAgent:
         else:
             backend = FilesystemBackend(root_dir=self.workspace)
 
-        # Sub-agents (multiple types)
+        # Build ChatOpenAI instance (with stream_usage=False for DashScope compat)
+        model_instance = self._build_chat_model()
+
+        # Sub-agents (multiple types) — keep using string-based model for sub-agents
         sub_agents = [
             SubAgent(
                 name="plan-analyze",
@@ -163,7 +186,7 @@ class CodingAgent:
         ]
 
         # System prompt with model-specific overrides
-        provider = getattr(self.model_config, "provider", "openai")
+        provider = getattr(self.model_config, "provider", "dashscope")
         system_prompt = mode.format_prompt(self.workspace, provider)
 
         # HITL: interrupt before tool execution for permission checks.
@@ -171,7 +194,7 @@ class CodingAgent:
         # checks permissions against pending tool calls, and yields
         # approval_needed events. resume() sends Command(resume=...) to continue.
         agent = create_deep_agent(
-            model=self.model_config.to_model_string(),
+            model=model_instance,
             tools=tools,
             system_prompt=system_prompt,
             subagents=sub_agents,

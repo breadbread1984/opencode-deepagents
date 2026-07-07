@@ -156,11 +156,11 @@ class GradioApp:
             choices=["build", "plan"], value=DEFAULT_AGENT_MODE, label="Agent Mode",
         )
         self.model_provider = gr.Dropdown(
-            choices=["openai", "anthropic", "ollama"], value="openai", label="Provider",
+            choices=["dashscope", "openai", "anthropic", "ollama"], value="dashscope", label="Provider",
         )
-        self.model_name = gr.Textbox(value="gpt-4o", label="Model")
+        self.model_name = gr.Textbox(value="qwen3.6-plus", label="Model")
         self.api_key = gr.Textbox(label="API Key", type="password", placeholder="sk-...")
-        self.api_base = gr.Textbox(label="Base URL (optional)", placeholder="https://api.openai.com/v1")
+        self.api_base = gr.Textbox(label="Base URL (optional)", placeholder="https://dashscope-intl.aliyuncs.com/compatible-mode/v1")
         self.workspace_path = gr.Textbox(value=DEFAULT_WORKSPACE, label="Workspace")
         self.approve_all_cb = gr.Checkbox(value=False, label="Auto-approve all tools (skip HITL)")
         with gr.Row():
@@ -279,16 +279,16 @@ class GradioApp:
 
     def _on_session_change(self, session_id: str):
         if not session_id:
-            return DEFAULT_AGENT_MODE, DEFAULT_WORKSPACE, "gpt-4o"
+            return DEFAULT_AGENT_MODE, DEFAULT_WORKSPACE, "qwen3.6-plus"
         session = get_session(session_id)
         if not session:
-            return DEFAULT_AGENT_MODE, DEFAULT_WORKSPACE, "gpt-4o"
+            return DEFAULT_AGENT_MODE, DEFAULT_WORKSPACE, "qwen3.6-plus"
         self.current_session_id = session_id
         self.agent = None
         return (
             session.get("agent_mode", DEFAULT_AGENT_MODE),
             session.get("workspace", DEFAULT_WORKSPACE),
-            session.get("model", "gpt-4o"),
+            session.get("model", "qwen3.6-plus"),
         )
 
     # ── Chat Handlers ──

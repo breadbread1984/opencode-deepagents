@@ -77,7 +77,7 @@ def _migrate(conn: sqlite3.Connection):
 def create_session(
     name: str = "Untitled",
     workspace: str = ".",
-    model: str = "gpt-4o",
+    model: str = "qwen3.6-plus",
     agent_mode: str = "build",
 ) -> str:
     """Create a new session. Returns session ID."""

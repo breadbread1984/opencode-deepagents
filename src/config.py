@@ -18,15 +18,25 @@ load_dotenv()
 
 @dataclass
 class ModelConfig:
-    provider: str = "openai"
-    model: str = "gpt-4o"
+    provider: str = "dashscope"
+    model: str = "qwen3.6-plus"
     temperature: float = 0.0
     api_key: str = ""
     base_url: str = ""
 
+    @property
+    def langchain_provider(self) -> str:
+        """Map our provider name to what langchain's init_chat_model expects.
+
+        dashscope uses the OpenAI SDK, so map it to 'openai' for langchain.
+        """
+        if self.provider == "dashscope":
+            return "openai"
+        return self.provider
+
     def to_model_string(self) -> str:
         """Format for deepagents model parameter: 'provider:model'."""
-        return f"{self.provider}:{self.model}"
+        return f"{self.langchain_provider}:{self.model}"
 
 
 # ── System Prompts ──────────────────────────────────────────────────
@@ -233,12 +243,26 @@ def _append_skills_listing(prompt: str, workspace: str) -> str:
 
 def load_model_config() -> ModelConfig:
     """Load model configuration from environment variables."""
+    provider = os.getenv("LLM_PROVIDER", "dashscope")
+
+    # DashScope defaults
+    if provider == "dashscope":
+        default_model = "qwen3.6-plus"
+        default_base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+        api_key = os.getenv("DASHSCOPE_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+        base_url = os.getenv("DASHSCOPE_BASE_URL", os.getenv("OPENAI_BASE_URL", default_base_url))
+    else:
+        default_model = "gpt-4o"
+        default_base_url = ""
+        api_key = os.getenv("OPENAI_API_KEY", os.getenv("ANTHROPIC_API_KEY", ""))
+        base_url = os.getenv("OPENAI_BASE_URL", "")
+
     return ModelConfig(
-        provider=os.getenv("LLM_PROVIDER", "openai"),
-        model=os.getenv("LLM_MODEL", "gpt-4o"),
+        provider=provider,
+        model=os.getenv("LLM_MODEL", default_model),
         temperature=float(os.getenv("LLM_TEMPERATURE", "0.0")),
-        api_key=os.getenv("OPENAI_API_KEY", os.getenv("ANTHROPIC_API_KEY", "")),
-        base_url=os.getenv("OPENAI_BASE_URL", ""),
+        api_key=api_key,
+        base_url=base_url,
     )
 
 

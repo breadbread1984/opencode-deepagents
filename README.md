@@ -163,11 +163,13 @@ Type these in the chat:
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | `openai` | Model provider |
-| `LLM_MODEL` | `gpt-4o` | Model name |
-| `OPENAI_API_KEY` | — | API key |
+| `LLM_PROVIDER` | `dashscope` | Model provider (`dashscope`, `openai`, `anthropic`, `ollama`) |
+| `LLM_MODEL` | `qwen3.6-plus` | Model name |
+| `DASHSCOPE_API_KEY` | — | DashScope API key (default provider) |
+| `OPENAI_API_KEY` | — | OpenAI API key |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key |
-| `OPENAI_BASE_URL` | — | OpenAI-compatible API endpoint (supports DashScope, Ollama, etc.) |
+| `DASHSCOPE_BASE_URL` | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` | DashScope API endpoint |
+| `OPENAI_BASE_URL` | — | OpenAI-compatible API endpoint (supports Ollama, etc.) |
 | `MAX_TOOL_ITERATIONS` | `50` | Max tool calls per turn |
 | `TOOL_TIMEOUT_SECONDS` | `120` | Tool timeout |
 | `DEFAULT_AGENT_MODE` | `build` | Default agent mode |
