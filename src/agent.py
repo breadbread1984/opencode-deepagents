@@ -6,9 +6,14 @@ multi-file patch tool, question tool, skill loader, and background sub-agents.
 
 import asyncio
 import json
+import os
 import threading
 from pathlib import Path
 from typing import Optional, AsyncIterator
+
+# Load .env BEFORE any LangChain imports so LangSmith / API keys are picked up
+from dotenv import load_dotenv
+load_dotenv()
 
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend, LocalShellBackend

@@ -18,6 +18,10 @@ import os
 import sys
 from pathlib import Path
 
+# Load .env before any LangChain imports (LangSmith, API keys, etc.)
+from dotenv import load_dotenv
+load_dotenv()
+
 
 def main():
     parser = argparse.ArgumentParser(
