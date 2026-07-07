@@ -283,7 +283,7 @@ class CodingAgent:
 
         # After the stream finishes (may be interrupted), check if the graph
         # is paused at the tools node (interrupt_on triggered).
-        state = self.graph.get_state(config)
+        state = await self.graph.aget_state(config)
         is_interrupted = bool(state and state.next and "tools" in state.next)
 
         if is_interrupted and not approve_all:
@@ -296,7 +296,7 @@ class CodingAgent:
 
                 if action == PermissionAction.DENY:
                     # Auto-reject — inject rejection and resume automatically
-                    self.graph.invoke(
+                    await self.graph.ainvoke(
                         Command(resume={"decision": "rejected", "tool_call_id": tc["id"]}),
                         config=config,
                     )
@@ -328,7 +328,7 @@ class CodingAgent:
 
         if not had_approval and is_interrupted and not approve_all:
             # All pending tools are auto-allowed — resume the graph silently
-            self.graph.invoke(
+            await self.graph.ainvoke(
                 Command(resume={"decision": "approved_all"}),
                 config=config,
             )
@@ -361,7 +361,7 @@ class CodingAgent:
 
         # Record the decision if user chose "remember"
         if remember and approved:
-            state = self.graph.get_state(config)
+            state = await self.graph.aget_state(config)
             pending_tools = _extract_pending_tool_calls(state)
             for tc in pending_tools:
                 if tc["id"] == tool_call_id:
@@ -407,11 +407,11 @@ class CodingAgent:
                 }
 
         # After resume completes, check for further interrupts (multi-tool turns)
-        state = self.graph.get_state(config)
+        state = await self.graph.aget_state(config)
         is_interrupted = bool(state and state.next and "tools" in state.next)
         if is_interrupted:
             # Auto-resume with approval for remaining auto-allowed tools
-            self.graph.invoke(
+            await self.graph.ainvoke(
                 Command(resume={"decision": "approved_all"}),
                 config=config,
             )
@@ -422,15 +422,15 @@ class CodingAgent:
         """Synchronous invoke — returns final state (no HITL)."""
         config = {"configurable": {"thread_id": thread_id}}
         self.snapshot.track(f"pre-invoke-{thread_id}")
-        return self.graph.invoke(
+        return asyncio.run(self.graph.ainvoke(
             {"messages": [{"role": "user", "content": user_message}]},
             config=config,
-        )
+        ))
 
     def get_state(self, thread_id: str = "default"):
         """Get LangGraph state for a thread."""
         config = {"configurable": {"thread_id": thread_id}}
-        return self.graph.get_state(config)
+        return asyncio.run(self.graph.aget_state(config))
 
     def get_messages(self, thread_id: str = "default") -> list:
         """Get messages from the conversation state."""
