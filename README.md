@@ -9,7 +9,11 @@ opencode-deepagents/
 ├── app.py                     # CLI entry point (--port, --share, --workspace, --mode)
 ├── requirements.txt           # Python dependencies
 ├── .env.example               # API key configuration
+├── .dockerignore
 ├── README.md
+├── docker/
+│   ├── Dockerfile               # Docker image definition
+│   └── docker-compose.yml       # Docker Compose config
 └── src/
     ├── __init__.py
     ├── agent.py               # CodingAgent with deepagents harness + HITL + snapshots
@@ -109,6 +113,38 @@ pip install -r requirements.txt
 python app.py                        # http://127.0.0.1:7860
 python app.py --port 8080 --share    # Public URL
 python app.py --workspace ~/my-project --mode plan
+```
+
+## Docker Compose Deployment
+
+```bash
+# 1. Configure environment
+cp .env.example .env
+# Edit .env with your API keys
+
+# 2. Build and start
+cd docker
+docker compose up -d
+
+# 3. Open http://localhost:7860
+```
+
+### Docker Compose options
+
+| Variable | Default | Description |
+|---|---|---|
+| `HOST_PORT` | `7860` | Host port to bind |
+| `DEFAULT_AGENT_MODE` | `build` | Agent mode: `build` or `plan` |
+
+```bash
+# Custom port
+HOST_PORT=8080 docker compose up -d
+
+# Plan mode (read-only)
+DEFAULT_AGENT_MODE=plan docker compose up -d
+
+# Mount a host directory as workspace
+# Edit docker-compose.yml, uncomment the volume mount under services.opencode-deepagents.volumes
 ```
 
 ### Commands
