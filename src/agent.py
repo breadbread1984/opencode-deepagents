@@ -66,6 +66,7 @@ class CodingAgent:
 
         # Track checkpointer for proper cleanup on rebuild
         self._checkpointer = None
+        self._checkpointer_ctx = None
 
         # Permission system with HITL
         self.permission = permission_config or build_default_permissions(agent_mode, self.workspace)
@@ -89,7 +90,13 @@ class CodingAgent:
     def _create_checkpointer(self):
         """Create or reuse a checkpointer. Closes old SQLite connections on rebuild."""
         if self._checkpointer is not None:
-            if hasattr(self._checkpointer, "close"):
+            if self._checkpointer_ctx is not None:
+                try:
+                    self._checkpointer_ctx.__exit__(None, None, None)
+                except Exception:
+                    pass
+                self._checkpointer_ctx = None
+            elif hasattr(self._checkpointer, "close"):
                 try:
                     self._checkpointer.close()
                 except Exception:
@@ -101,7 +108,8 @@ class CodingAgent:
         else:
             db_path = Path(self.checkpoint_db_path)
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._checkpointer = SqliteSaver.from_conn_string(str(db_path))
+            self._checkpointer_ctx = SqliteSaver.from_conn_string(str(db_path))
+            self._checkpointer = self._checkpointer_ctx.__enter__()
 
         return self._checkpointer
 
@@ -455,7 +463,13 @@ class CodingAgent:
 
     def close(self):
         """Release resources (checkpointer connections)."""
-        if self._checkpointer is not None and hasattr(self._checkpointer, "close"):
+        if self._checkpointer_ctx is not None:
+            try:
+                self._checkpointer_ctx.__exit__(None, None, None)
+            except Exception:
+                pass
+            self._checkpointer_ctx = None
+        elif self._checkpointer is not None and hasattr(self._checkpointer, "close"):
             try:
                 self._checkpointer.close()
             except Exception:
