@@ -251,6 +251,10 @@ def load_model_config() -> ModelConfig:
         default_base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
         api_key = os.getenv("DASHSCOPE_API_KEY", os.getenv("OPENAI_API_KEY", ""))
         base_url = os.getenv("DASHSCOPE_BASE_URL", os.getenv("OPENAI_BASE_URL", default_base_url))
+        # ChatOpenAI / OpenAI SDK checks OPENAI_API_KEY env var internally;
+        # ensure it's set when using dashscope credentials
+        if api_key and not os.environ.get("OPENAI_API_KEY"):
+            os.environ["OPENAI_API_KEY"] = api_key
     else:
         default_model = "gpt-4o"
         default_base_url = ""

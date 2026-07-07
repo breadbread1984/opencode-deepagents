@@ -141,6 +141,9 @@ class CodingAgent:
         }
         if self.model_config.api_key:
             kwargs["openai_api_key"] = self.model_config.api_key
+            # ChatOpenAI / the OpenAI SDK also checks OPENAI_API_KEY env var
+            # internally — set it so the key is found regardless of code path
+            os.environ["OPENAI_API_KEY"] = self.model_config.api_key
         if self.model_config.base_url:
             kwargs["openai_api_base"] = self.model_config.base_url
         return ChatOpenAI(**kwargs)
