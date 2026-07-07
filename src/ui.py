@@ -4,7 +4,6 @@ Supports: HITL permission approvals, snapshot/undo controls, background tasks,
 MCP config, question display, LSP tools, and multi-file apply_patch.
 """
 
-import json
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -14,7 +13,7 @@ import gradio as gr
 from src.agent import CodingAgent, BackgroundTask
 from src.config import (
     load_model_config, ModelConfig, AGENT_MODES,
-    DEFAULT_AGENT_MODE, DEFAULT_WORKSPACE, DANGEROUS_TOOLS,
+    DEFAULT_AGENT_MODE, DEFAULT_WORKSPACE,
 )
 from src.session import (
     create_session, list_sessions, get_session, delete_session,
@@ -23,7 +22,7 @@ from src.session import (
 from src.tools.mcp import load_mcp_configs
 
 CSS = """
-:root {
+::root {
     --bg-primary: #0d1117;
     --bg-secondary: #161b22;
     --bg-tertiary: #21262d;
@@ -110,6 +109,8 @@ class GradioApp:
         self.current_session_id: Optional[str] = None
         self._pending_thread_id: Optional[str] = None
         self._pending_tool_call_id: Optional[str] = None
+        self._pending_tool_name: Optional[str] = None
+        self._submit_lock = False
 
     def build(self) -> gr.Blocks:
         with gr.Blocks(theme=THEME, css=CSS, title="OpenCode DeepAgents", fill_height=True) as app:
@@ -152,13 +153,10 @@ class GradioApp:
         gr.Markdown("### Settings")
 
         self.agent_mode = gr.Dropdown(
-            choices=["build", "plan"],
-            value=DEFAULT_AGENT_MODE,
-            label="Agent Mode",
+            choices=["build", "plan"], value=DEFAULT_AGENT_MODE, label="Agent Mode",
         )
         self.model_provider = gr.Dropdown(
-            choices=["openai", "anthropic", "ollama"],
-            value="openai", label="Provider",
+            choices=["openai", "anthropic", "ollama"], value="openai", label="Provider",
         )
         self.model_name = gr.Textbox(value="gpt-4o", label="Model")
         self.api_key = gr.Textbox(label="API Key", type="password", placeholder="sk-...")
@@ -199,6 +197,9 @@ class GradioApp:
                 show_label=False, container=False,
             )
             self.send_btn = gr.Button("Send", scale=1, variant="primary")
+            self.approve_btn = gr.Button("Approve", scale=1, variant="primary", visible=False)
+            self.reject_btn = gr.Button("Reject", scale=1, variant="stop", visible=False)
+            self.remember_btn = gr.Button("Always Allow", scale=1, variant="secondary", visible=False)
 
     def _wire_events(self):
         # Sessions
@@ -210,17 +211,39 @@ class GradioApp:
         self.session_list.change(fn=self._on_session_change, inputs=[self.session_list],
                                   outputs=[self.agent_mode, self.workspace_path, self.model_name])
 
-        # Chat
+        # Chat — only one event source triggers send (use send_btn, not both)
         chat_inputs = [self.msg_input, self.chatbot, self.session_list,
                         self.agent_mode, self.workspace_path,
                         self.model_provider, self.model_name, self.api_key, self.api_base,
                         self.approve_all_cb]
         self.send_btn.click(fn=self._on_user_message, inputs=chat_inputs,
-                            outputs=[self.msg_input, self.chatbot], queue=True)
-        self.send_btn.click(fn=self._on_refresh_sessions, outputs=[self.session_list])
+                            outputs=[self.msg_input, self.chatbot, self.approve_btn,
+                                     self.reject_btn, self.remember_btn],
+                            queue=True)
         self.msg_input.submit(fn=self._on_user_message, inputs=chat_inputs,
-                              outputs=[self.msg_input, self.chatbot], queue=True)
-        self.msg_input.submit(fn=self._on_refresh_sessions, outputs=[self.session_list])
+                              outputs=[self.msg_input, self.chatbot, self.approve_btn,
+                                       self.reject_btn, self.remember_btn],
+                              queue=True)
+
+        # HITL approval buttons
+        self.approve_btn.click(
+            fn=self._on_approve,
+            inputs=[self.chatbot, self.session_list, self._hitl_state, self.approve_all_cb],
+            outputs=[self.chatbot, self.approve_btn, self.reject_btn, self.remember_btn],
+            queue=True,
+        )
+        self.reject_btn.click(
+            fn=self._on_reject,
+            inputs=[self.chatbot, self.session_list, self._hitl_state],
+            outputs=[self.chatbot, self.approve_btn, self.reject_btn, self.remember_btn],
+            queue=True,
+        )
+        self.remember_btn.click(
+            fn=self._on_remember_approve,
+            inputs=[self.chatbot, self.session_list, self._hitl_state],
+            outputs=[self.chatbot, self.approve_btn, self.reject_btn, self.remember_btn],
+            queue=True,
+        )
 
         # Settings
         self.apply_settings_btn.click(fn=self._on_apply_settings,
@@ -229,7 +252,8 @@ class GradioApp:
             outputs=[self.chatbot])
 
         # Undo & Snapshots
-        self.undo_btn.click(fn=self._on_undo, inputs=[self.session_list], outputs=[self.chatbot, self.snapshot_display])
+        self.undo_btn.click(fn=self._on_undo, inputs=[self.session_list],
+                            outputs=[self.chatbot, self.snapshot_display])
         self.snapshot_list_btn.click(fn=self._on_list_snapshots, outputs=[self.snapshot_display])
         self.refresh_mcp_btn.click(fn=lambda: self._render_mcp_status(), outputs=[self.mcp_status])
 
@@ -276,13 +300,13 @@ class GradioApp:
         approve_all,
     ):
         if not message or not message.strip():
-            yield "", history
+            yield "", history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
             return
 
         # Handle /commands
         if message.startswith("/"):
             result = self._handle_command(message, history)
-            yield "", result
+            yield "", result, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
             return
 
         session_id = self._ensure_session(session_id, message)
@@ -290,12 +314,11 @@ class GradioApp:
         self._ensure_agent(model_config, workspace, agent_mode)
 
         history.append({"role": "user", "content": message})
-        yield "", history
+        yield "", history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
 
         parts = []
         token_buf = ""
         subagent_active = False
-        last_tool_class = ""
 
         try:
             thread_id = get_thread_id(session_id) or f"session-{session_id}"
@@ -308,16 +331,25 @@ class GradioApp:
                     token_buf += event.get("content", "")
 
                 elif etype == "approval_needed":
-                    # HITL: tool needs approval
+                    # HITL: flush token buffer, show approval box, and STOP
                     if token_buf:
                         parts.append(("text", token_buf))
                         token_buf = ""
+
                     self._pending_tool_call_id = event["tool_call_id"]
+                    self._pending_tool_name = event["tool"]
+
                     parts.append(("approval_needed", {
                         "tool": event["tool"],
                         "input": event["input"],
                         "tool_call_id": event["tool_call_id"],
                     }))
+
+                    rendered = self._render_parts(parts, token_buf)
+                    history = self._set_last_assistant(history, rendered)
+
+                    yield "", history, gr.update(visible=True), gr.update(visible=True), gr.update(visible=True)
+                    return  # Stop here — wait for user approval
 
                 elif etype == "tool_start":
                     if token_buf:
@@ -346,17 +378,198 @@ class GradioApp:
                         token_buf = ""
 
                 rendered = self._render_parts(parts, token_buf)
-                self._set_last_assistant(history, rendered)
-                yield "", history
+                history = self._set_last_assistant(history, rendered)
+                yield "", history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
 
             rendered = self._render_parts(parts, "")
-            self._set_last_assistant(history, rendered)
+            history = self._set_last_assistant(history, rendered)
             update_session(session_id, agent_mode=agent_mode, workspace=workspace, model=model_name)
 
         except Exception as e:
             history.append({"role": "assistant", "content": f"Error: {e}"})
 
-        yield "", history
+        yield "", history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+
+    async def _on_approve(self, history, session_id, hitl_state, approve_all):
+        """Handle user approval of a pending tool call."""
+        if not self.agent or not self._pending_tool_call_id:
+            yield history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+            return
+
+        thread_id = get_thread_id(session_id) or f"session-{session_id}"
+        parts = self._parse_existing_parts(history)
+        token_buf = ""
+
+        try:
+            async for event in self.agent.resume(thread_id, approved=True, tool_call_id=self._pending_tool_call_id):
+                etype = event["type"]
+
+                if etype == "token":
+                    token_buf += event.get("content", "")
+
+                elif etype == "tool_start":
+                    if token_buf:
+                        parts.append(("text", token_buf))
+                        token_buf = ""
+                    name = event["name"]
+                    cls = self._tool_class(name)
+                    parts.append(("tool_start", {
+                        "name": name, "input": event.get("input", ""),
+                        "css_class": cls, "subagent": name == "task",
+                    }))
+
+                elif etype == "tool_end":
+                    parts.append(("tool_end", {
+                        "name": event.get("name", ""),
+                        "output": event.get("output", ""),
+                        "subagent": False,
+                    }))
+
+                elif etype == "done":
+                    if token_buf:
+                        parts.append(("text", token_buf))
+                        token_buf = ""
+
+                rendered = self._render_parts(parts, token_buf)
+                history = self._set_last_assistant(history, rendered)
+                yield history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+
+            rendered = self._render_parts(parts, "")
+            history = self._set_last_assistant(history, rendered)
+
+        except Exception as e:
+            history.append({"role": "assistant", "content": f"Error: {e}"})
+
+        self._pending_tool_call_id = None
+        self._pending_tool_name = None
+        yield history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+
+    async def _on_reject(self, history, session_id, hitl_state):
+        """Handle user rejection of a pending tool call."""
+        if not self.agent or not self._pending_tool_call_id:
+            yield history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+            return
+
+        thread_id = get_thread_id(session_id) or f"session-{session_id}"
+        parts = self._parse_existing_parts(history)
+        token_buf = ""
+
+        # Replace the approval box with rejection note
+        parts.append(("text", f"\n\n*Tool call **{self._pending_tool_name or 'unknown'}** was rejected.*\n"))
+
+        try:
+            async for event in self.agent.resume(thread_id, approved=False, tool_call_id=self._pending_tool_call_id):
+                etype = event["type"]
+
+                if etype == "token":
+                    token_buf += event.get("content", "")
+
+                elif etype == "tool_start":
+                    if token_buf:
+                        parts.append(("text", token_buf))
+                        token_buf = ""
+                    name = event["name"]
+                    cls = self._tool_class(name)
+                    parts.append(("tool_start", {
+                        "name": name, "input": event.get("input", ""),
+                        "css_class": cls, "subagent": name == "task",
+                    }))
+
+                elif etype == "tool_end":
+                    parts.append(("tool_end", {
+                        "name": event.get("name", ""),
+                        "output": event.get("output", ""),
+                        "subagent": False,
+                    }))
+
+                elif etype == "done":
+                    if token_buf:
+                        parts.append(("text", token_buf))
+                        token_buf = ""
+
+                rendered = self._render_parts(parts, token_buf)
+                history = self._set_last_assistant(history, rendered)
+                yield history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+
+            rendered = self._render_parts(parts, "")
+            history = self._set_last_assistant(history, rendered)
+
+        except Exception as e:
+            history.append({"role": "assistant", "content": f"Error: {e}"})
+
+        self._pending_tool_call_id = None
+        self._pending_tool_name = None
+        yield history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+
+    async def _on_remember_approve(self, history, session_id, hitl_state):
+        """Approve AND remember this decision permanently."""
+        if not self.agent or not self._pending_tool_call_id:
+            yield history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+            return
+
+        thread_id = get_thread_id(session_id) or f"session-{session_id}"
+        parts = self._parse_existing_parts(history)
+        token_buf = ""
+
+        try:
+            async for event in self.agent.resume(
+                thread_id, approved=True, tool_call_id=self._pending_tool_call_id,
+                remember=True,
+            ):
+                etype = event["type"]
+
+                if etype == "token":
+                    token_buf += event.get("content", "")
+
+                elif etype == "tool_start":
+                    if token_buf:
+                        parts.append(("text", token_buf))
+                        token_buf = ""
+                    name = event["name"]
+                    cls = self._tool_class(name)
+                    parts.append(("tool_start", {
+                        "name": name, "input": event.get("input", ""),
+                        "css_class": cls, "subagent": name == "task",
+                    }))
+
+                elif etype == "tool_end":
+                    parts.append(("tool_end", {
+                        "name": event.get("name", ""),
+                        "output": event.get("output", ""),
+                        "subagent": False,
+                    }))
+
+                elif etype == "done":
+                    if token_buf:
+                        parts.append(("text", token_buf))
+                        token_buf = ""
+
+                rendered = self._render_parts(parts, token_buf)
+                history = self._set_last_assistant(history, rendered)
+                yield history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+
+            rendered = self._render_parts(parts, "")
+            history = self._set_last_assistant(history, rendered)
+
+        except Exception as e:
+            history.append({"role": "assistant", "content": f"Error: {e}"})
+
+        self._pending_tool_call_id = None
+        self._pending_tool_name = None
+        yield history, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+
+    def _parse_existing_parts(self, history) -> list:
+        """Parse the last assistant message back into render parts for continuation."""
+        if not history:
+            return []
+        last = history[-1] if history else None
+        if not last or last.get("role") != "assistant":
+            return []
+        content = last.get("content", "")
+        if not content:
+            return []
+        # Return text part containing the full rendered content as base
+        return [("text", content)]
 
     def _handle_command(self, message: str, history: list) -> list:
         cmd = message.strip().lower()
@@ -412,6 +625,8 @@ class GradioApp:
         if self.agent is None:
             self.agent = CodingAgent(model_config=model_config, workspace=workspace, agent_mode=agent_mode)
         elif self.agent.agent_mode != agent_mode or self.agent.workspace != ws_resolved:
+            # Close old agent to free DB connections
+            self.agent.close()
             self.agent = CodingAgent(model_config=model_config, workspace=workspace, agent_mode=agent_mode)
 
     def _tool_class(self, name: str) -> str:
@@ -439,17 +654,13 @@ class GradioApp:
                     result.append("</div>")
                     open_tool = None
                 tool = pdata["tool"]
-                inp = pdata["input"][:1000]
+                inp = str(pdata["input"])[:1000]
                 result.append(
                     f'<div class="approval-box">'
                     f'<span class="tool-name">Approve tool call?</span>'
                     f'<div><strong>{tool}</strong></div>'
                     f'<div class="tool-output">{inp}</div>'
-                    f'<div class="btn-row">'
-                    f'<span style="color:var(--accent-green)">[A]pprove</span> &nbsp; '
-                    f'<span style="color:var(--accent-red)">[R]eject</span> &nbsp; '
-                    f'<span style="color:var(--accent)">[Y] Always allow</span>'
-                    f'</div></div>'
+                    f'</div>'
                 )
 
             elif ptype == "tool_start":
@@ -468,7 +679,7 @@ class GradioApp:
                 if not icon:
                     icon = "🔧" if not pdata.get("subagent") else ""
 
-                inp = pdata["input"][:500]
+                inp = str(pdata["input"])[:500]
                 result.append(
                     f'<div class="{cls}">'
                     f'<span class="name">{icon} {pdata["name"]}</span>'
@@ -477,7 +688,7 @@ class GradioApp:
                 open_tool = pdata["name"]
 
             elif ptype == "tool_end":
-                out = pdata.get("output", "")[:800]
+                out = str(pdata.get("output", ""))[:800]
                 result.append(f'<div class="tool-output" style="max-height:200px">{out}</div>')
 
         if open_tool:
@@ -493,6 +704,7 @@ class GradioApp:
             history[-1]["content"] = content
         else:
             history.append({"role": "assistant", "content": content})
+        return history
 
     def _build_model_config(self, provider, model_name, api_key, api_base):
         config = load_model_config()
@@ -529,8 +741,7 @@ class GradioApp:
     # ── MCP Status ──
 
     def _render_mcp_status(self) -> str:
-        ws = str(Path(self.workspace_path.value if hasattr(self, 'workspace_path') else DEFAULT_WORKSPACE).resolve()) \
-            if hasattr(self, 'workspace_path') else DEFAULT_WORKSPACE
+        ws = str(Path(self.workspace_path.value).resolve()) if hasattr(self, 'workspace_path') else DEFAULT_WORKSPACE
         configs = load_mcp_configs(ws)
         if not configs:
             return '<span style="color:var(--text-secondary)">No MCP servers configured.</span><br>' \
@@ -545,6 +756,8 @@ class GradioApp:
 
     def _on_apply_settings(self, provider, model_name, api_key, api_base, agent_mode, workspace, session_id, approve_all):
         config = self._build_model_config(provider, model_name, api_key, api_base)
+        if self.agent:
+            self.agent.close()
         self.agent = CodingAgent(model_config=config, workspace=workspace, agent_mode=agent_mode)
         if session_id:
             update_session(session_id, model=model_name, agent_mode=agent_mode, workspace=workspace)

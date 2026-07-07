@@ -14,10 +14,9 @@ Examples:
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def main():
@@ -40,7 +39,6 @@ Examples:
 
     args = parser.parse_args()
 
-    import os
     os.environ["DEFAULT_WORKSPACE"] = str(Path(args.workspace).resolve())
     os.environ["DEFAULT_AGENT_MODE"] = args.mode
 

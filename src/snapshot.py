@@ -4,12 +4,11 @@ Mimics original opencode's git-snapshot approach:
 - track()  — record current filesystem state as a commit
 - restore() — revert filesystem to a previous snapshot
 - diff()   — show what changed since a snapshot
-- revert() — undo specific changes via reverse patch
+- cleanup() — remove old snapshots to keep disk usage bounded
 """
 
 import subprocess
 import hashlib
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -47,7 +46,6 @@ class SnapshotStore:
     def _copy_workspace_to_snapshot(self):
         """Copy current workspace files into snapshot dir (respecting .gitignore)."""
         import shutil
-        # Copy files from workspace to snapshot dir
         ws = Path(self.workspace)
         for item in ws.iterdir():
             if item.name == ".git" or item.name.startswith("."):
@@ -56,7 +54,9 @@ class SnapshotStore:
             if item.is_dir():
                 if dest.exists():
                     shutil.rmtree(dest)
-                shutil.copytree(item, dest, ignore=shutil.ignore_patterns(".git", "__pycache__", "*.pyc", "node_modules"))
+                shutil.copytree(item, dest, ignore=shutil.ignore_patterns(
+                    ".git", "__pycache__", "*.pyc", "node_modules",
+                ))
             else:
                 shutil.copy2(item, dest)
 
@@ -136,15 +136,46 @@ class SnapshotStore:
         return snapshots
 
     def cleanup(self, keep: int = 50):
-        """Remove old snapshots, keeping the most recent N."""
+        """Remove old snapshots, keeping the most recent N.
+
+        Uses git rebase to squash old commits into the earliest kept one,
+        then garbage-collects to reclaim disk space.
+        """
         try:
-            all_hashes = self._git("log", "--format=%H").stdout.strip().split("\n")
-            if len(all_hashes) <= keep:
+            all_hashes = [
+                h for h in self._git("log", "--format=%H").stdout.strip().split("\n") if h
+            ]
+            total = len(all_hashes)
+            if total <= keep:
                 return
-            # Keep only :keep commits using rebase or squash
-            # For simplicity, we just log a note
+
+            # Keep the keep-most-recent commits, squash older ones
+            oldest_keep = all_hashes[keep - 1] if keep > 0 else all_hashes[0]
+            oldest_keep_parent = all_hashes[keep] if keep < total else None
+
+            if oldest_keep_parent:
+                # Create a replacement tree from the oldest kept commit
+                self._git("checkout", "--orphan", "_snapshot_cleanup")
+                # Copy the tree from oldest_keep
+                self._git("reset", "--hard", oldest_keep)
+                # Rebase remaining newer commits on top
+                newer = list(reversed(all_hashes[:keep - 1])) if keep > 1 else []
+                for sha in newer:
+                    self._git("cherry-pick", sha)
+
+                # Replace the branch
+                self._git("branch", "-M", "_snapshot_cleanup", "main")
+                self._git("gc", "--prune=now", "--aggressive")
         except Exception:
             pass
+
+    def snapshot_count(self) -> int:
+        """Return the number of snapshots stored."""
+        result = self._git("rev-list", "--count", "HEAD")
+        try:
+            return int(result.stdout.strip())
+        except (ValueError, TypeError):
+            return 0
 
 
 def _hash_path(path: str) -> str:

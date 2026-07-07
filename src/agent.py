@@ -5,6 +5,8 @@ multi-file patch tool, question tool, skill loader, and background sub-agents.
 """
 
 import asyncio
+import json
+import threading
 from pathlib import Path
 from typing import Optional, AsyncIterator
 
@@ -14,17 +16,18 @@ from deepagents.middleware.subagents import SubAgent
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import Command
 
 from src.config import (
     ModelConfig, AgentModeConfig, AGENT_MODES,
     load_model_config, PLAN_SUBAGENT_PROMPT, EXPLORE_SUBAGENT_PROMPT,
     DEFAULT_WORKSPACE, DEFAULT_AGENT_MODE, MAX_TOOL_ITERATIONS,
-    DANGEROUS_TOOLS, READONLY_TOOLS, CHECKPOINT_DB,
+    DANGEROUS_TOOLS, CHECKPOINT_DB,
 )
 from src.tools import get_all_custom_tools, get_custom_tools
 from src.permission import (
-    PermissionConfig, InterruptHandler, build_default_permissions,
-    load_permissions_from_config,
+    PermissionConfig, InterruptHandler, PermissionAction,
+    build_default_permissions, load_permissions_from_config,
 )
 from src.snapshot import SnapshotStore
 
@@ -61,6 +64,9 @@ class CodingAgent:
         self.mode_config = AGENT_MODES.get(agent_mode, AGENT_MODES["build"])
         self.checkpoint_db_path = checkpoint_db_path or CHECKPOINT_DB
 
+        # Track checkpointer for proper cleanup on rebuild
+        self._checkpointer = None
+
         # Permission system with HITL
         self.permission = permission_config or build_default_permissions(agent_mode, self.workspace)
         self.interrupt_handler = InterruptHandler(self.permission)
@@ -80,18 +86,37 @@ class CodingAgent:
         # Build the graph
         self.graph = self._build_graph()
 
+    def _create_checkpointer(self):
+        """Create or reuse a checkpointer. Closes old SQLite connections on rebuild."""
+        if self._checkpointer is not None:
+            if hasattr(self._checkpointer, "close"):
+                try:
+                    self._checkpointer.close()
+                except Exception:
+                    pass
+            self._checkpointer = None
+
+        if self.checkpoint_db_path == ":memory:":
+            self._checkpointer = MemorySaver()
+        else:
+            db_path = Path(self.checkpoint_db_path)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._checkpointer = SqliteSaver.from_conn_string(str(db_path))
+
+        return self._checkpointer
+
     def _build_graph(self):
         """Build the deep agent with mode-appropriate configuration and HITL."""
         mode = self.mode_config
         tools = get_all_custom_tools(self.workspace)
 
-        # ── Filesystem Backend ──
+        # Filesystem Backend
         if mode.allow_shell:
             backend = LocalShellBackend(root_dir=self.workspace)
         else:
             backend = FilesystemBackend(root_dir=self.workspace)
 
-        # ── Sub-agents (multiple types) ──
+        # Sub-agents (multiple types)
         sub_agents = [
             SubAgent(
                 name="plan-analyze",
@@ -117,19 +142,16 @@ class CodingAgent:
             ),
         ]
 
-        # ── Checkpointer (persistent state across turns) ──
-        if self.checkpoint_db_path == ":memory:":
-            checkpointer = MemorySaver()
-        else:
-            db_path = Path(self.checkpoint_db_path)
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            checkpointer = SqliteSaver.from_conn_string(str(db_path))
+        checkpointer = self._create_checkpointer()
 
-        # ── System prompt with model-specific overrides ──
+        # System prompt with model-specific overrides
         provider = getattr(self.model_config, "provider", "openai")
         system_prompt = mode.format_prompt(self.workspace, provider)
 
-        # ── Create the deep agent with HITL ──
+        # HITL: interrupt before tool execution for permission checks.
+        # When the graph pauses at the tools node, astream() detects this,
+        # checks permissions against pending tool calls, and yields
+        # approval_needed events. resume() sends Command(resume=...) to continue.
         agent = create_deep_agent(
             model=self.model_config.to_model_string(),
             tools=tools,
@@ -137,7 +159,6 @@ class CodingAgent:
             sub_agents=sub_agents,
             backend=backend,
             checkpointer=checkpointer,
-            # HITL: interrupt before tool execution for permission checks
             interrupt_before=["tools"],
         )
 
@@ -150,9 +171,10 @@ class CodingAgent:
         """Stream agent execution with HITL permission checks.
 
         When a tool needs approval, yields:
-            {"type": "approval_needed", "tool": "...", "input": "..."}
+            {"type": "approval_needed", "tool": "...", "input": "...", "tool_call_id": "..."}
 
-        The caller must call resume() to approve or reject.
+        The caller must call resume() to approve or reject, then call astream()
+        again with the same thread_id to continue after approval.
 
         Args:
             user_message: User's input message
@@ -169,17 +191,18 @@ class CodingAgent:
         config = {"configurable": {"thread_id": thread_id}}
 
         last_tool_name = None
-        pending_approval = None
-        tool_inputs = {}  # tool_call_id -> input preview
 
         # Reset interrupt handler for this turn
         self.interrupt_handler = InterruptHandler(self.permission)
-        # Re-apply saved approvals
+        # Re-apply saved approvals/denials from previous turns
         self.interrupt_handler.permission.approved = self.permission.approved
         self.interrupt_handler.permission.denied = self.permission.denied
 
         # Snapshot before starting
         self.snapshot.track(f"pre-{thread_id}")
+
+        interrupted = False
+        had_approval = False
 
         async for event in self.graph.astream_events(
             {"messages": [{"role": "user", "content": user_message}]},
@@ -196,88 +219,7 @@ class CodingAgent:
 
             elif kind == "on_tool_start":
                 name = event.get("name", "unknown")
-                inp = event["data"].get("input", {})
-                safe_input = _format_tool_input(inp)
-                tool_call_id = event.get("run_id", str(hash(str(inp))))
-                tool_inputs[tool_call_id] = inp
-
-                # Permission check via HITL
-                if not approve_all and self.interrupt_handler.should_interrupt(name, inp) == "ask":
-                    # Take snapshot before dangerous operations
-                    if name in DANGEROUS_TOOLS:
-                        self.snapshot.track(f"pre-{name}")
-
-                    yield {
-                        "type": "approval_needed",
-                        "tool": name,
-                        "input": safe_input,
-                        "tool_call_id": tool_call_id,
-                    }
-                    # Don't yield tool_start yet — wait for approval
-                    pending_approval = (name, inp, tool_call_id)
-                    continue
-
-                last_tool_name = name
-                yield {
-                    "type": "tool_start",
-                    "name": name,
-                    "input": safe_input,
-                }
-
-            elif kind == "on_tool_end":
-                if pending_approval and event.get("run_id") == pending_approval[2]:
-                    # This tool was approved — now emit start + end together
-                    pname, pinp, pid = pending_approval
-                    yield {
-                        "type": "tool_start",
-                        "name": pname,
-                        "input": _format_tool_input(pinp),
-                    }
-                    pending_approval = None
-
-                output = event["data"].get("output", "")
-                yield {
-                    "type": "tool_end",
-                    "name": event.get("name", last_tool_name or "unknown"),
-                    "output": str(output)[:2000],
-                }
-
-        # Persist approval state
-        self.permission.approved.update(self.interrupt_handler.permission.approved)
-        self.permission.denied.update(self.interrupt_handler.permission.denied)
-
-        yield {"type": "done"}
-
-    async def resume(
-        self, thread_id: str, approved: bool, tool_call_id: str,
-    ) -> AsyncIterator[dict]:
-        """Resume agent execution after HITL approval decision.
-
-        Args:
-            thread_id: LangGraph thread ID
-            approved: Whether the user approved the tool call
-            tool_call_id: The tool call ID to approve/reject
-        """
-        config = {"configurable": {"thread_id": thread_id}}
-        approved_val = "approved" if approved else "rejected"
-        resume_input = {"decisions": {tool_call_id: approved_val}}
-
-        last_tool_name = None
-
-        async for event in self.graph.astream_events(
-            resume_input, config=config, version="v2",
-        ):
-            kind = event.get("event", "")
-
-            if kind == "on_chat_model_stream":
-                chunk = event["data"]["chunk"]
-                delta = getattr(chunk, "content", "")
-                if delta:
-                    yield {"type": "token", "content": delta}
-
-            elif kind == "on_tool_start":
-                name = event.get("name", "unknown")
-                inp = event["data"].get("input", {})
+                inp = _safe_tool_input(event["data"].get("input"))
                 last_tool_name = name
                 yield {
                     "type": "tool_start",
@@ -293,10 +235,143 @@ class CodingAgent:
                     "output": str(output)[:2000],
                 }
 
+        # After the stream finishes (may be interrupted), check if the graph
+        # is paused at the tools node (interrupt_before=["tools"] triggered).
+        state = self.graph.get_state(config)
+        is_interrupted = bool(state and state.next and "tools" in state.next)
+
+        if is_interrupted and not approve_all:
+            # Extract pending tool calls from the saved state
+            pending_tools = _extract_pending_tool_calls(state)
+            for tc in pending_tools:
+                name = tc["name"]
+                args = tc["args"]
+                action = self.interrupt_handler.should_interrupt(name, args)
+
+                if action == PermissionAction.DENY:
+                    # Auto-reject — inject rejection and resume automatically
+                    self.graph.invoke(
+                        Command(resume={"decision": "rejected", "tool_call_id": tc["id"]}),
+                        config=config,
+                    )
+                    yield {
+                        "type": "tool_start",
+                        "name": name,
+                        "input": _format_tool_input(args),
+                    }
+                    yield {
+                        "type": "tool_end",
+                        "name": name,
+                        "output": f"Tool '{name}' was denied by permission rules.",
+                    }
+
+                elif action == PermissionAction.ASK:
+                    # Take snapshot before dangerous operations
+                    if name in DANGEROUS_TOOLS:
+                        self.snapshot.track(f"pre-{name}")
+
+                    had_approval = True
+                    yield {
+                        "type": "approval_needed",
+                        "tool": name,
+                        "input": _format_tool_input(args),
+                        "tool_call_id": tc["id"],
+                    }
+
+                # action == ALLOW: the resume() call with approval will let it through
+
+        if not had_approval and is_interrupted and not approve_all:
+            # All pending tools are auto-allowed — resume the graph silently
+            self.graph.invoke(
+                Command(resume={"decision": "approved_all"}),
+                config=config,
+            )
+
+        # Persist approval state for future turns
+        self.permission.approved.update(self.interrupt_handler.permission.approved)
+        self.permission.denied.update(self.interrupt_handler.permission.denied)
+
+        yield {"type": "done"}
+
+    async def resume(
+        self, thread_id: str, approved: bool, tool_call_id: str,
+        remember: bool = False,
+    ) -> AsyncIterator[dict]:
+        """Resume agent execution after HITL approval decision.
+
+        Sends Command(resume=...) to LangGraph so the interrupted tools node
+        proceeds with the user's decision.
+
+        Args:
+            thread_id: LangGraph thread ID
+            approved: Whether the user approved the tool call
+            tool_call_id: The tool call ID to approve/reject
+            remember: Whether to save this decision permanently
+        """
+        config = {"configurable": {"thread_id": thread_id}}
+        decision = "approved" if approved else "rejected"
+
+        # Record the decision if user chose "remember"
+        if remember and approved:
+            state = self.graph.get_state(config)
+            pending_tools = _extract_pending_tool_calls(state)
+            for tc in pending_tools:
+                if tc["id"] == tool_call_id:
+                    filepath = ""
+                    for key in ("path", "file_path", "command"):
+                        if key in tc["args"]:
+                            filepath = str(tc["args"][key])[:200]
+                            break
+                    self.permission.approve(tc["name"], filepath, remember=True)
+                    break
+
+        cmd = Command(resume={"decision": decision, "tool_call_id": tool_call_id})
+
+        last_tool_name = None
+
+        async for event in self.graph.astream_events(
+            cmd, config=config, version="v2",
+        ):
+            kind = event.get("event", "")
+
+            if kind == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                delta = getattr(chunk, "content", "")
+                if delta:
+                    yield {"type": "token", "content": delta}
+
+            elif kind == "on_tool_start":
+                name = event.get("name", "unknown")
+                inp = _safe_tool_input(event["data"].get("input"))
+                last_tool_name = name
+                yield {
+                    "type": "tool_start",
+                    "name": name,
+                    "input": _format_tool_input(inp),
+                }
+
+            elif kind == "on_tool_end":
+                output = event["data"].get("output", "")
+                yield {
+                    "type": "tool_end",
+                    "name": event.get("name", last_tool_name or "unknown"),
+                    "output": str(output)[:2000],
+                }
+
+        # After resume completes, check for further interrupts (multi-tool turns)
+        state = self.graph.get_state(config)
+        is_interrupted = bool(state and state.next and "tools" in state.next)
+        if is_interrupted:
+            # Auto-resume with approval for remaining auto-allowed tools
+            self.graph.invoke(
+                Command(resume={"decision": "approved_all"}),
+                config=config,
+            )
+
         yield {"type": "done"}
 
     def invoke(self, user_message: str, thread_id: str = "default") -> dict:
-        """Synchronous invoke — returns final state."""
+        """Synchronous invoke — returns final state (no HITL)."""
         config = {"configurable": {"thread_id": thread_id}}
         self.snapshot.track(f"pre-invoke-{thread_id}")
         return self.graph.invoke(
@@ -357,10 +432,19 @@ class CodingAgent:
     # ── Background Task Support ──
 
     def start_background_task(self, task_id: str, prompt: str):
-        """Start a background sub-agent task. Returns immediately."""
+        """Start a background sub-agent task. Returns immediately.
+
+        Handles both async (event loop available) and sync (no event loop) contexts.
+        """
         task = BackgroundTask(task_id, prompt, self)
         self._bg_tasks[task_id] = task
-        asyncio.create_task(task.run())
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(task.run())
+        except RuntimeError:
+            # No running event loop — use a daemon thread
+            t = threading.Thread(target=lambda: asyncio.run(task.run()), daemon=True)
+            t.start()
         return task
 
     def get_background_task(self, task_id: str) -> Optional["BackgroundTask"]:
@@ -368,6 +452,15 @@ class CodingAgent:
 
     def list_background_tasks(self) -> list[dict]:
         return [t.status() for t in self._bg_tasks.values()]
+
+    def close(self):
+        """Release resources (checkpointer connections)."""
+        if self._checkpointer is not None and hasattr(self._checkpointer, "close"):
+            try:
+                self._checkpointer.close()
+            except Exception:
+                pass
+        self._checkpointer = None
 
 
 class BackgroundTask:
@@ -387,6 +480,13 @@ class BackgroundTask:
             async for event in self.agent.astream(self.prompt, thread_id=f"bg-{self.task_id}"):
                 if event["type"] == "done":
                     break
+                if event["type"] == "approval_needed":
+                    # Auto-approve background tasks
+                    async for _ in self.agent.resume(
+                        f"bg-{self.task_id}", approved=True,
+                        tool_call_id=event["tool_call_id"],
+                    ):
+                        pass
                 elif event["type"] == "token":
                     messages.append(event.get("content", ""))
             self.result = "".join(messages) if messages else "(empty response)"
@@ -412,13 +512,70 @@ class BackgroundTask:
         return self.result
 
 
+# ── Helpers ──
+
+def _extract_pending_tool_calls(state) -> list[dict]:
+    """Extract pending tool call info from an interrupted LangGraph state."""
+    if not state or not state.values:
+        return []
+    messages = state.values.get("messages", [])
+    if not messages:
+        return []
+    last_msg = messages[-1]
+    tool_calls = getattr(last_msg, "tool_calls", None)
+    if not tool_calls:
+        # May be a list of dicts or structured objects
+        additional = getattr(last_msg, "additional_kwargs", {})
+        raw_calls = additional.get("tool_calls", [])
+        tool_calls = []
+        for rc in raw_calls:
+            fn = rc.get("function", {})
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            tool_calls.append({
+                "id": rc.get("id", ""),
+                "name": fn.get("name", "unknown"),
+                "args": args,
+            })
+    result = []
+    for tc in tool_calls:
+        if isinstance(tc, dict):
+            result.append({
+                "id": tc.get("id", ""),
+                "name": tc.get("name", "unknown"),
+                "args": tc.get("args", {}),
+            })
+        else:
+            result.append({
+                "id": getattr(tc, "id", ""),
+                "name": getattr(tc, "name", "unknown"),
+                "args": getattr(tc, "args", {}),
+            })
+    return result
+
+
+def _safe_tool_input(inp) -> dict:
+    """Normalize tool input to a dict, handling non-dict types."""
+    if isinstance(inp, dict):
+        return inp
+    if isinstance(inp, str):
+        try:
+            return json.loads(inp)
+        except (json.JSONDecodeError, TypeError):
+            return {"input": inp}
+    if inp is None:
+        return {}
+    return {"input": str(inp)}
+
+
 def _format_tool_input(inp: dict, max_len: int = 500) -> str:
     """Format tool input dict for display, truncating long values."""
-    import json as _json
     safe = {}
     for k, v in inp.items():
         s = str(v)
         if len(s) > max_len:
             s = s[:max_len] + f"... ({len(s)} total chars)"
         safe[k] = s
-    return _json.dumps(safe, indent=2, ensure_ascii=False)
+    return json.dumps(safe, indent=2, ensure_ascii=False)
