@@ -66,7 +66,7 @@ def web_search(query: str) -> str:
         Search results with titles, URLs, and snippets
     """
     try:
-        from duckduckgo_search import DDGS
+        from ddgs import DDGS
 
         with DDGS() as ddgs:
             results = list(ddgs.text(query, max_results=5))
@@ -83,7 +83,7 @@ def web_search(query: str) -> str:
 
         return "\n\n".join(output)
     except ImportError:
-        return "Missing dependency: duckduckgo-search. Install with: pip install duckduckgo-search"
+        return "Missing dependency: ddgs. Install with: pip install ddgs"
     except Exception as e:
         return f"Error searching: {e}"
 
